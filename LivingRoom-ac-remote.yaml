@@ -1,0 +1,215 @@
+substitutions:
+  device_name: "living-room-ac-remote"
+  friendly_name: "Living-room-ac-remote"
+  device_description: "Living room Fujitsu AC"
+  room_name: Living
+
+esphome:
+  name: ${device_name}
+  comment: ${device_description}  
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework: 
+    type: arduino
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/mistic100/ESPHome-IRremoteESP8266
+    components: [ir_remote_base, fujitsu]
+
+# Enable logging with verbose IR debugging
+logger:
+  level: VERBOSE
+  logs:
+    remote_receiver: VERBOSE
+    remote_transmitter: VERBOSE
+    remote.fujitsu_general: VERBOSE
+    remote.fujitsu: VERBOSE
+    climate: VERBOSE
+    component.irremoteesp8266: VERBOSE
+  
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+  services:
+    - service: send_ac_command
+      variables:
+        mode: string
+        temperature: float
+        fan_mode: string
+      then:
+        - lambda: |-
+            ESP_LOGD("service", "Sending AC command: mode=%s, temp=%.1f, fan=%s", mode.c_str(), temperature, fan_mode.c_str());
+            
+            auto call = id(fujitsu_tx).make_call();
+            
+            // Set mode
+            if (mode == "OFF") call.set_mode(CLIMATE_MODE_OFF);
+            else if (mode == "COOL") call.set_mode(CLIMATE_MODE_COOL);
+            else if (mode == "HEAT") call.set_mode(CLIMATE_MODE_HEAT);
+            else if (mode == "AUTO") call.set_mode(CLIMATE_MODE_AUTO);
+            else if (mode == "DRY") call.set_mode(CLIMATE_MODE_DRY);
+            else if (mode == "FAN") call.set_mode(CLIMATE_MODE_FAN_ONLY);
+            
+            // Set temperature
+            call.set_target_temperature(temperature);
+            
+            // Set fan mode
+            if (fan_mode == "AUTO") call.set_fan_mode(CLIMATE_FAN_AUTO);
+            else if (fan_mode == "LOW") call.set_fan_mode(CLIMATE_FAN_LOW);
+            else if (fan_mode == "MEDIUM") call.set_fan_mode(CLIMATE_FAN_MEDIUM);
+            else if (fan_mode == "HIGH") call.set_fan_mode(CLIMATE_FAN_HIGH);
+            
+            call.perform();
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+    
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: ${friendly_name}
+    password: !secret ap_password
+
+captive_portal:
+
+# AHT10 uses I2C communication
+i2c:
+  sda: GPIO8
+  scl: GPIO9
+    
+sensor:
+  - platform: aht10
+    variant: AHT10
+    temperature:
+      name: "${room_name} room Temperature"
+      id: ${room_name}_temperature
+      accuracy_decimals: 1
+    humidity:
+      name: "${room_name} room Humidity"
+      id: ${room_name}_humidity
+      accuracy_decimals: 1
+    update_interval: 60s
+
+# IR Receiver
+remote_receiver:
+  id: ac_ir_reciver
+  pin:
+    number: GPIO2
+    inverted: true
+  tolerance: 60%
+  filter: 125us
+  idle: 30ms
+  buffer_size: 4096
+  rmt_channel: 2
+  dump: all  # Enable for debugging
+
+# IR Transmitter
+remote_transmitter:
+  id: ac_ir_transmit
+  pin: 
+    number: GPIO10
+    inverted: false
+  carrier_duty_percent: 50%
+  rmt_channel: 0
+
+# Global variables to track state
+globals:
+  - id: current_mode
+    type: int
+    initial_value: '0'  # 0=OFF, 1=COOL, 2=HEAT, 3=AUTO, 4=DRY, 5=FAN
+  - id: current_target_temp
+    type: float
+    initial_value: '22.0'
+  - id: current_fan_mode
+    type: int
+    initial_value: '0'  # 0=AUTO, 1=LOW, 2=MED, 3=HIGH
+
+climate:
+  # Main climate using fujitsu_general for receiving IR signals
+  - platform: fujitsu_general
+    id: main_climate
+    name: "${room_name} AC Climate Control"
+    sensor: ${room_name}_temperature
+    receiver_id: ac_ir_reciver
+    supports_cool: true
+    supports_heat: true
+    visual:
+      min_temperature: 16
+      max_temperature: 30
+      temperature_step: 1
+    # When state changes (from remote), update our globals
+    on_state:
+      - lambda: |-
+          ESP_LOGD("climate", "Main climate state changed via remote");
+          id(current_mode) = (int)x.mode;
+          id(current_target_temp) = x.target_temperature;
+          if (x.fan_mode.has_value()) {
+            id(current_fan_mode) = (int)x.fan_mode.value();
+          }
+
+  # Hidden fujitsu climate for transmitting only
+  - platform: fujitsu
+    model: ARRAH2E
+    id: fujitsu_tx
+    name: "${room_name} AC TX (Hidden)"
+    sensor: ${room_name}_temperature
+    transmitter_id: ac_ir_transmit
+    internal: true  # Hide from Home Assistant
+    visual:
+      min_temperature: 16
+      max_temperature: 30
+      temperature_step: 1
+
+# Manual control buttons for testing and backup control
+button:
+  - platform: template
+    name: "${room_name} AC Cool 22°C"
+    id: cool_22
+    on_press:
+      - lambda: |-
+          auto call = id(fujitsu_tx).make_call();
+          call.set_mode(CLIMATE_MODE_COOL);
+          call.set_target_temperature(22.0);
+          call.set_fan_mode(CLIMATE_FAN_AUTO);
+          call.perform();
+          
+  - platform: template
+    name: "${room_name} AC Heat 24°C"
+    id: heat_24
+    on_press:
+      - lambda: |-
+          auto call = id(fujitsu_tx).make_call();
+          call.set_mode(CLIMATE_MODE_HEAT);
+          call.set_target_temperature(24.0);
+          call.set_fan_mode(CLIMATE_FAN_AUTO);
+          call.perform();
+          
+  - platform: template
+    name: "${room_name} AC Off"
+    id: ac_off
+    on_press:
+      - lambda: |-
+          auto call = id(fujitsu_tx).make_call();
+          call.set_mode(CLIMATE_MODE_OFF);
+          call.perform();
+
+  - platform: template
+    name: "${room_name} Send Current State"
+    id: send_current
+    on_press:
+      - lambda: |-
+          ESP_LOGD("button", "Sending current state to AC");
+          auto call = id(fujitsu_tx).make_call();
+          call.set_mode(id(main_climate).mode);
+          call.set_target_temperature(id(main_climate).target_temperature);
+          call.set_fan_mode(id(main_climate).fan_mode);
+          call.perform();
